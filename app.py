@@ -1,4 +1,3 @@
-
 import os
 import html
 import joblib
@@ -152,21 +151,30 @@ st.markdown(
         object-fit: cover;
     }}
 
-    /* Keep Streamlit columns responsive; movie cards are rendered in small grids. */
-    [data-testid="stHorizontalBlock"] {{ gap: 0.8rem !important; }}
+    [data-testid="stHorizontalBlock"] {{
+        gap: 0.8rem !important;
+    }}
+
     [data-testid="stVerticalBlockBorderWrapper"] {{
         border-radius: var(--app-radius) !important;
         border-color: var(--app-border) !important;
         transition: transform .18s ease, box-shadow .18s ease;
     }}
+
     [data-testid="stVerticalBlockBorderWrapper"]:hover {{
         transform: translateY(-3px);
         box-shadow: 0 10px 28px rgba(0,0,0,.18);
     }}
-    div.stButton > button {{ transition: all .18s ease; }}
-    div.stButton > button:hover {{ border-color: var(--app-accent); color: var(--app-accent); }}
 
-    /* Phones */
+    div.stButton > button {{
+        transition: all .18s ease;
+    }}
+
+    div.stButton > button:hover {{
+        border-color: var(--app-accent);
+        color: var(--app-accent);
+    }}
+
     @media (max-width: 600px) {{
         .hero {{
             padding: 18px;
@@ -184,7 +192,6 @@ st.markdown(
         }}
     }}
 
-    /* Large monitors and televisions */
     @media (min-width: 1600px) {{
         [data-testid="stMainBlockContainer"] {{
             max-width: 1800px;
@@ -233,6 +240,7 @@ def load_models():
     ]
 
     missing = [n for n in names if not (MODEL_DIR / n).exists()]
+
     if missing:
         raise FileNotFoundError(
             "Missing files in models/: " + ", ".join(missing)
@@ -296,7 +304,7 @@ MOVIES = prepare_movies()
 
 
 # ==========================================================
-# 5. TMDB API
+# 5. TMDB API + LOCAL FALLBACK
 # ==========================================================
 
 def get_api_key():
@@ -325,6 +333,7 @@ def tmdb_get(endpoint, params=None):
         )
         response.raise_for_status()
         return response.json()
+
     except requests.RequestException:
         return {}
 
@@ -332,6 +341,7 @@ def tmdb_get(endpoint, params=None):
 def image_url(path, size="w500"):
     if not path:
         return None
+
     return f"{IMAGE_BASE}{size}{path}"
 
 
@@ -358,7 +368,458 @@ GENRES = {
 }
 
 
+# ==========================================================
+# LOCAL FALLBACK HELPERS
+# ==========================================================
+
+def local_movie_records(frame):
+    """
+    Convert local MOVIES rows into the same basic dictionary
+    structure used by TMDB movie objects.
+    """
+
+    if frame is None or frame.empty:
+        return []
+
+    result = []
+
+    for _, row in frame.iterrows():
+        movie = {}
+
+        for column, value in row.items():
+            if pd.isna(value):
+                if column in ["vote_average"]:
+                    value = 0
+                else:
+                    value = ""
+
+            movie[column] = value
+
+        try:
+            movie["id"] = int(movie["id"])
+        except (ValueError, TypeError):
+            continue
+
+        movie["title"] = str(
+            movie.get("title", "Untitled")
+        )
+
+        movie["overview"] = str(
+            movie.get("overview", "") or ""
+        )
+
+        movie["release_date"] = str(
+            movie.get("release_date", "") or ""
+        )
+
+        try:
+            movie["vote_average"] = float(
+                movie.get("vote_average", 0) or 0
+            )
+        except (ValueError, TypeError):
+            movie["vote_average"] = 0
+
+        result.append(movie)
+
+    return result
+
+
+def local_search_movies(query):
+    """
+    Search the trained local movie catalog when TMDB search
+    is unavailable.
+    """
+
+    if MOVIES.empty or not query.strip():
+        return []
+
+    query_lower = query.strip().lower()
+
+    titles = MOVIES["title"].astype(str)
+
+    exact = MOVIES[
+        titles.str.lower() == query_lower
+    ].copy()
+
+    partial = MOVIES[
+        titles.str.lower().str.contains(
+            query_lower,
+            na=False,
+            regex=False
+        )
+    ].copy()
+
+    if not exact.empty:
+        partial = pd.concat(
+            [exact, partial],
+            ignore_index=True
+        ).drop_duplicates("id")
+
+    return local_movie_records(
+        partial.head(20)
+    )
+
+
+def local_discover_movies(category, page=1, per_page=20):
+    """
+    Local replacement for TMDB discovery endpoints.
+
+    The local catalog is used only when TMDB does not provide
+    results.
+    """
+
+    if MOVIES.empty:
+        return []
+
+    movies = MOVIES.copy()
+
+    # ------------------------------------------------------
+    # Release date preparation
+    # ------------------------------------------------------
+
+    if "release_date" in movies.columns:
+        movies["_release_date"] = pd.to_datetime(
+            movies["release_date"],
+            errors="coerce"
+        )
+    else:
+        movies["_release_date"] = pd.NaT
+
+    # ------------------------------------------------------
+    # Popular
+    # ------------------------------------------------------
+
+    if category == "Popular":
+
+        if "popularity" in movies.columns:
+            movies = movies.sort_values(
+                "popularity",
+                ascending=False,
+                na_position="last"
+            )
+        else:
+            movies = movies.sort_values(
+                "vote_average",
+                ascending=False,
+                na_position="last"
+            )
+
+    # ------------------------------------------------------
+    # Highest Rated
+    # ------------------------------------------------------
+
+    elif category == "Highest Rated":
+
+        movies = movies.sort_values(
+            "vote_average",
+            ascending=False,
+            na_position="last"
+        )
+
+    # ------------------------------------------------------
+    # Latest
+    # ------------------------------------------------------
+
+    elif category == "Latest":
+
+        movies = movies[
+            movies["_release_date"].notna()
+        ].sort_values(
+            "_release_date",
+            ascending=False
+        )
+
+    # ------------------------------------------------------
+    # Upcoming
+    # ------------------------------------------------------
+
+    elif category == "Upcoming":
+
+        movies = movies[
+            movies["_release_date"] > pd.Timestamp(TODAY)
+        ].sort_values(
+            "_release_date",
+            ascending=True
+        )
+
+    # ------------------------------------------------------
+    # Now Playing
+    # ------------------------------------------------------
+
+    elif category == "Now Playing":
+
+        start_date = pd.Timestamp(
+            TODAY - timedelta(days=60)
+        )
+
+        movies = movies[
+            (movies["_release_date"] >= start_date) &
+            (movies["_release_date"] <= pd.Timestamp(TODAY))
+        ].sort_values(
+            "_release_date",
+            ascending=False
+        )
+
+    # ------------------------------------------------------
+    # Trending
+    # ------------------------------------------------------
+
+    elif category == "Trending":
+
+        if "popularity" in movies.columns:
+            movies = movies.sort_values(
+                "popularity",
+                ascending=False,
+                na_position="last"
+            )
+        else:
+            movies = movies.sort_values(
+                "vote_average",
+                ascending=False,
+                na_position="last"
+            )
+
+    # ------------------------------------------------------
+    # Kids & Family
+    # ------------------------------------------------------
+
+    elif category == "Kids & Family":
+
+        # If genre information exists, try to use it.
+        genre_columns = [
+            column for column in movies.columns
+            if "genre" in column.lower()
+        ]
+
+        if genre_columns:
+
+            genre_column = genre_columns[0]
+
+            mask = movies[genre_column].astype(
+                str
+            ).str.contains(
+                "family|animation|kids|children",
+                case=False,
+                na=False,
+                regex=True
+            )
+
+            filtered = movies[mask].copy()
+
+            if not filtered.empty:
+                movies = filtered
+
+        # If no genre information is available, retain the
+        # catalog rather than returning an empty page.
+        movies = movies.sort_values(
+            "vote_average",
+            ascending=False,
+            na_position="last"
+        )
+
+    else:
+        return []
+
+    movies = movies.drop_duplicates(
+        subset=["id"]
+    )
+
+    start = max(0, (page - 1) * per_page)
+    end = start + per_page
+
+    movies = movies.iloc[start:end]
+
+    return local_movie_records(movies)
+
+
+def local_movie_details(movie_id):
+    """
+    Return local metadata for a movie when TMDB details are
+    unavailable.
+    """
+
+    if MOVIES.empty or movie_id is None:
+        return {}
+
+    try:
+        movie_id = int(movie_id)
+    except (ValueError, TypeError):
+        return {}
+
+    matches = MOVIES[
+        MOVIES["id"] == movie_id
+    ]
+
+    if matches.empty:
+        return {}
+
+    records = local_movie_records(
+        matches.head(1)
+    )
+
+    if not records:
+        return {}
+
+    return records[0]
+
+
+def local_similar_movies(movie_id, count=20):
+    """
+    Use the trained hybrid model as the local fallback for
+    similar/recommended movies.
+    """
+
+    if not MODEL_READY or MOVIES.empty:
+        return []
+
+    try:
+        movie_id = int(movie_id)
+    except (ValueError, TypeError):
+        return []
+
+    recommendations = hybrid_recommend(
+        movie_id,
+        count
+    )
+
+    if recommendations.empty:
+        return []
+
+    return recommendations.to_dict(
+        "records"
+    )
+
+
+def local_filtered_movies(
+    genre,
+    year_range,
+    minimum_rating,
+    sort_by
+):
+    """
+    Local fallback for the Search/Filters page.
+    """
+
+    if MOVIES.empty:
+        return []
+
+    movies = MOVIES.copy()
+
+    # ------------------------------------------------------
+    # Rating
+    # ------------------------------------------------------
+
+    if "vote_average" in movies.columns:
+        movies["vote_average"] = pd.to_numeric(
+            movies["vote_average"],
+            errors="coerce"
+        ).fillna(0)
+
+        movies = movies[
+            movies["vote_average"] >= minimum_rating
+        ]
+
+    # ------------------------------------------------------
+    # Release year
+    # ------------------------------------------------------
+
+    if "release_date" in movies.columns:
+
+        movies["_release_date"] = pd.to_datetime(
+            movies["release_date"],
+            errors="coerce"
+        )
+
+        movies = movies[
+            (
+                movies["_release_date"].dt.year >=
+                year_range[0]
+            )
+            &
+            (
+                movies["_release_date"].dt.year <=
+                year_range[1]
+            )
+        ]
+
+    # ------------------------------------------------------
+    # Genre
+    # ------------------------------------------------------
+
+    if genre != "All genres":
+
+        genre_columns = [
+            column for column in movies.columns
+            if "genre" in column.lower()
+        ]
+
+        if genre_columns:
+
+            genre_column = genre_columns[0]
+
+            movies = movies[
+                movies[genre_column]
+                .astype(str)
+                .str.contains(
+                    genre,
+                    case=False,
+                    na=False,
+                    regex=False
+                )
+            ]
+
+    # ------------------------------------------------------
+    # Sorting
+    # ------------------------------------------------------
+
+    if sort_by == "Rating":
+
+        movies = movies.sort_values(
+            "vote_average",
+            ascending=False,
+            na_position="last"
+        )
+
+    elif sort_by == "Release date":
+
+        if "_release_date" not in movies.columns:
+            movies["_release_date"] = pd.to_datetime(
+                movies["release_date"],
+                errors="coerce"
+            )
+
+        movies = movies.sort_values(
+            "_release_date",
+            ascending=False,
+            na_position="last"
+        )
+
+    else:
+
+        if "popularity" in movies.columns:
+            movies = movies.sort_values(
+                "popularity",
+                ascending=False,
+                na_position="last"
+            )
+        else:
+            movies = movies.sort_values(
+                "vote_average",
+                ascending=False,
+                na_position="last"
+            )
+
+    return local_movie_records(
+        movies.head(20)
+    )
+
+
+# ==========================================================
+# TMDB DISCOVERY
+# ==========================================================
+
 def discover_movies(category, page=1):
+
     if category == "Trending":
         endpoint = "trending/movie/day"
         params = {"page": page}
@@ -386,7 +847,8 @@ def discover_movies(category, page=1):
             "sort_by": "primary_release_date.desc",
             "primary_release_date.gte":
                 (TODAY - timedelta(days=365)).isoformat(),
-            "primary_release_date.lte": TODAY.isoformat(),
+            "primary_release_date.lte":
+                TODAY.isoformat(),
             "vote_count.gte": 5
         }
 
@@ -394,7 +856,8 @@ def discover_movies(category, page=1):
         endpoint = "discover/movie"
         params = {
             "page": page,
-            "with_genres": f"{GENRES['Animation']},{GENRES['Family']}",
+            "with_genres":
+                f"{GENRES['Animation']},{GENRES['Family']}",
             "sort_by": "popularity.desc",
             "include_adult": "false"
         }
@@ -402,13 +865,46 @@ def discover_movies(category, page=1):
     else:
         return []
 
-    result = tmdb_get(endpoint, params)
-    return result.get("results", []) if isinstance(result, dict) else []
+    # ------------------------------------------------------
+    # Primary source: TMDB
+    # ------------------------------------------------------
 
+    result = tmdb_get(
+        endpoint,
+        params
+    )
+
+    tmdb_results = (
+        result.get("results", [])
+        if isinstance(result, dict)
+        else []
+    )
+
+    if tmdb_results:
+        return tmdb_results
+
+    # ------------------------------------------------------
+    # Fallback: local catalog
+    # ------------------------------------------------------
+
+    return local_discover_movies(
+        category,
+        page=page
+    )
+
+
+# ==========================================================
+# SEARCH
+# ==========================================================
 
 def search_movies(query):
+
     if not query.strip():
         return []
+
+    # ------------------------------------------------------
+    # Primary source: TMDB
+    # ------------------------------------------------------
 
     result = tmdb_get(
         "search/movie",
@@ -418,36 +914,112 @@ def search_movies(query):
             "page": 1
         }
     )
-    return result.get("results", []) if isinstance(result, dict) else []
 
+    tmdb_results = (
+        result.get("results", [])
+        if isinstance(result, dict)
+        else []
+    )
+
+    if tmdb_results:
+        return tmdb_results
+
+    # ------------------------------------------------------
+    # Fallback: local catalog
+    # ------------------------------------------------------
+
+    return local_search_movies(query)
+
+
+# ==========================================================
+# MOVIE DETAILS
+# ==========================================================
 
 def tmdb_details(movie_id):
+
     if not movie_id:
         return {}
-    return tmdb_get(f"movie/{int(movie_id)}")
 
+    result = tmdb_get(
+        f"movie/{int(movie_id)}"
+    )
+
+    if isinstance(result, dict) and result:
+        return result
+
+    # ------------------------------------------------------
+    # Fallback: local movie metadata
+    # ------------------------------------------------------
+
+    return local_movie_details(movie_id)
+
+
+# ==========================================================
+# SIMILAR MOVIES
+# ==========================================================
 
 def tmdb_similar(movie_id):
+
     if not movie_id:
         return []
 
-    result = tmdb_get(f"movie/{int(movie_id)}/recommendations")
-    movies = result.get("results", []) if isinstance(result, dict) else []
+    # ------------------------------------------------------
+    # Primary source: TMDB recommendations
+    # ------------------------------------------------------
+
+    result = tmdb_get(
+        f"movie/{int(movie_id)}/recommendations"
+    )
+
+    movies = (
+        result.get("results", [])
+        if isinstance(result, dict)
+        else []
+    )
+
+    # ------------------------------------------------------
+    # TMDB similar endpoint
+    # ------------------------------------------------------
 
     if len(movies) < 10:
-        similar = tmdb_get(f"movie/{int(movie_id)}/similar")
+
+        similar = tmdb_get(
+            f"movie/{int(movie_id)}/similar"
+        )
+
         if isinstance(similar, dict):
-            movies += similar.get("results", [])
+
+            movies += similar.get(
+                "results",
+                []
+            )
+
+    # ------------------------------------------------------
+    # Remove duplicates
+    # ------------------------------------------------------
 
     unique = []
     seen = set()
+
     for movie in movies:
+
         mid = movie.get("id")
+
         if mid and mid not in seen:
             seen.add(mid)
             unique.append(movie)
 
-    return unique
+    if unique:
+        return unique
+
+    # ------------------------------------------------------
+    # Fallback: local hybrid model
+    # ------------------------------------------------------
+
+    return local_similar_movies(
+        movie_id,
+        count=20
+    )
 
 
 # ==========================================================
@@ -455,15 +1027,26 @@ def tmdb_similar(movie_id):
 # ==========================================================
 
 def get_content_scores(movie_id):
+
     if not MODEL_READY:
         return {}
 
     indices = MODEL["movie_indices"]
 
     try:
-        if isinstance(indices, (dict, pd.Series)):
-            idx = indices.get(movie_id, indices.get(str(movie_id)))
+
+        if isinstance(
+            indices,
+            (dict, pd.Series)
+        ):
+
+            idx = indices.get(
+                movie_id,
+                indices.get(str(movie_id))
+            )
+
             index_items = indices.items()
+
         else:
             return {}
 
@@ -478,85 +1061,164 @@ def get_content_scores(movie_id):
         ).flatten()
 
         scores = {}
+
         for mid, index in index_items:
+
             try:
-                scores[int(mid)] = float(similarities[index])
-            except (ValueError, TypeError, IndexError):
+
+                scores[int(mid)] = float(
+                    similarities[index]
+                )
+
+            except (
+                ValueError,
+                TypeError,
+                IndexError
+            ):
                 continue
 
         return scores
+
     except Exception:
         return {}
 
 
 def get_collaborative_scores(movie_id):
+
     if not MODEL_READY:
         return {}
 
     movie_to_idx = MODEL["movie_to_idx"]
-    factors = np.asarray(MODEL["movie_factors"])
+    factors = np.asarray(
+        MODEL["movie_factors"]
+    )
 
-    idx = movie_to_idx.get(movie_id, movie_to_idx.get(str(movie_id)))
+    idx = movie_to_idx.get(
+        movie_id,
+        movie_to_idx.get(str(movie_id))
+    )
 
     if idx is None:
         return {}
 
     target = factors[idx]
-    norms = np.linalg.norm(factors, axis=1) * np.linalg.norm(target)
+
+    norms = (
+        np.linalg.norm(
+            factors,
+            axis=1
+        )
+        *
+        np.linalg.norm(target)
+    )
+
     dots = factors @ target
 
     similarities = np.divide(
         dots,
         norms,
-        out=np.zeros_like(dots, dtype=float),
+        out=np.zeros_like(
+            dots,
+            dtype=float
+        ),
         where=norms != 0
     )
 
     scores = {}
+
     for mid, index in movie_to_idx.items():
+
         try:
-            scores[int(mid)] = float(similarities[index])
-        except (ValueError, TypeError, IndexError):
+
+            scores[int(mid)] = float(
+                similarities[index]
+            )
+
+        except (
+            ValueError,
+            TypeError,
+            IndexError
+        ):
             continue
 
     return scores
 
 
-@st.cache_data(show_spinner=False, max_entries=128)
+@st.cache_data(
+    show_spinner=False,
+    max_entries=128
+)
 def hybrid_recommend(movie_id, count=20):
+
     if not MODEL_READY or MOVIES.empty:
         return pd.DataFrame()
 
-    content = get_content_scores(int(movie_id))
-    collaborative = get_collaborative_scores(int(movie_id))
+    content = get_content_scores(
+        int(movie_id)
+    )
+
+    collaborative = get_collaborative_scores(
+        int(movie_id)
+    )
 
     if not content and not collaborative:
         return pd.DataFrame()
 
     ids = set(content) | set(collaborative)
+
     rows = []
 
     for mid in ids:
+
         if mid == int(movie_id):
             continue
 
-        c_score = content.get(mid, 0.0)
-        cf_score = collaborative.get(mid, 0.0)
+        c_score = content.get(
+            mid,
+            0.0
+        )
+
+        cf_score = collaborative.get(
+            mid,
+            0.0
+        )
 
         # Rescale cosine similarity from [-1, 1] to [0, 1].
-        cf_score = max(0.0, (cf_score + 1.0) / 2.0)
+        cf_score = max(
+            0.0,
+            (cf_score + 1.0) / 2.0
+        )
 
-        combined = 0.6 * c_score + 0.4 * cf_score
-        rows.append((mid, combined))
+        combined = (
+            0.6 * c_score
+            +
+            0.4 * cf_score
+        )
+
+        rows.append(
+            (mid, combined)
+        )
 
     if not rows:
         return pd.DataFrame()
 
-    ranking = pd.DataFrame(rows, columns=["id", "hybrid_score"])
-    result = ranking.merge(MOVIES, on="id", how="inner")
+    ranking = pd.DataFrame(
+        rows,
+        columns=[
+            "id",
+            "hybrid_score"
+        ]
+    )
+
+    result = ranking.merge(
+        MOVIES,
+        on="id",
+        how="inner"
+    )
 
     return result.sort_values(
-        "hybrid_score", ascending=False
+        "hybrid_score",
+        ascending=False
     ).head(count)
 
 
@@ -581,16 +1243,24 @@ if "filtered_movies" not in st.session_state:
 
 
 def is_saved(collection, movie):
-    return str(movie.get("id", "")) in collection
+
+    return str(
+        movie.get("id", "")
+    ) in collection
 
 
 def toggle_saved(collection, movie):
-    mid = str(movie.get("id", ""))
+
+    mid = str(
+        movie.get("id", "")
+    )
+
     if not mid:
         return
 
     if mid in collection:
         del collection[mid]
+
     else:
         collection[mid] = movie
 
@@ -599,35 +1269,98 @@ def toggle_saved(collection, movie):
 # 8. MOVIE CARD
 # ==========================================================
 
-def movie_card(movie, source, section="default"):
+def movie_card(
+    movie,
+    source,
+    section="default"
+):
+
     if source == "model":
+
         mid = int(movie["id"])
-        title = str(movie.get("title", "Untitled"))
-        poster = movie.get("poster_path")
-        rating = movie.get("vote_average", 0)
-        release = str(movie.get("release_date", "") or "")
-        overview = str(movie.get("overview", "") or "")
+
+        title = str(
+            movie.get(
+                "title",
+                "Untitled"
+            )
+        )
+
+        poster = movie.get(
+            "poster_path"
+        )
+
+        rating = movie.get(
+            "vote_average",
+            0
+        )
+
+        release = str(
+            movie.get(
+                "release_date",
+                ""
+            )
+            or ""
+        )
+
+        overview = str(
+            movie.get(
+                "overview",
+                ""
+            )
+            or ""
+        )
 
         movie_data = {
             "id": mid,
             "title": title,
-            "poster_path": poster if isinstance(poster, str) else None,
+            "poster_path":
+                poster
+                if isinstance(
+                    poster,
+                    str
+                )
+                else None,
             "vote_average": rating,
             "release_date": release,
             "overview": overview
         }
+
     else:
+
         mid = movie.get("id")
-        title = movie.get("title") or "Untitled"
-        poster = movie.get("poster_path")
-        rating = movie.get("vote_average", 0)
-        release = movie.get("release_date", "") or ""
+
+        title = movie.get(
+            "title"
+        ) or "Untitled"
+
+        poster = movie.get(
+            "poster_path"
+        )
+
+        rating = movie.get(
+            "vote_average",
+            0
+        )
+
+        release = movie.get(
+            "release_date",
+            ""
+        ) or ""
+
         movie_data = dict(movie)
 
     with st.container(border=True):
+
         if poster:
-            st.image(image_url(poster), width="stretch")
+
+            st.image(
+                image_url(poster),
+                width="stretch"
+            )
+
         else:
+
             st.markdown(
                 f"""
                 <div style="
@@ -638,7 +1371,9 @@ def movie_card(movie, source, section="default"):
                     background:{theme["panel"]};
                     border-radius:8px;
                     color:{theme["muted"]};
-                ">No poster available</div>
+                ">
+                    No poster available
+                </div>
                 """,
                 unsafe_allow_html=True
             )
@@ -649,106 +1384,295 @@ def movie_card(movie, source, section="default"):
         )
 
         try:
-            rating_text = f"⭐ {float(rating):.1f}"
-        except (ValueError, TypeError):
-            rating_text = "Rating unavailable"
 
-        year = release[:4] if len(release) >= 4 else "Unknown year"
-        st.caption(f"{rating_text} · {year}")
+            rating_text = (
+                f"⭐ {float(rating):.1f}"
+            )
+
+        except (
+            ValueError,
+            TypeError
+        ):
+
+            rating_text = (
+                "Rating unavailable"
+            )
+
+        year = (
+            release[:4]
+            if len(release) >= 4
+            else "Unknown year"
+        )
+
+        st.caption(
+            f"{rating_text} · {year}"
+        )
 
         if st.button(
             "Details",
             key=f"details_{section}_{source}_{mid}",
             width="stretch"
         ):
+
             st.session_state.selected_movie = movie_data
-            st.session_state.page = "Movie details"
+            st.session_state.page = (
+                "Movie details"
+            )
             st.rerun()
 
         col1, col2 = st.columns(2)
 
         with col1:
-            saved = is_saved(st.session_state.bookmarks, movie_data)
+
+            saved = is_saved(
+                st.session_state.bookmarks,
+                movie_data
+            )
+
             if st.button(
-                "★ Saved" if saved else "☆ Save",
+                "★ Saved"
+                if saved
+                else "☆ Save",
                 key=f"bookmark_{section}_{source}_{mid}",
                 width="stretch"
             ):
-                toggle_saved(st.session_state.bookmarks, movie_data)
+
+                toggle_saved(
+                    st.session_state.bookmarks,
+                    movie_data
+                )
+
                 st.rerun()
 
         with col2:
-            saved = is_saved(st.session_state.watch_later, movie_data)
+
+            saved = is_saved(
+                st.session_state.watch_later,
+                movie_data
+            )
+
             if st.button(
-                "✓ Added" if saved else "＋ Later",
+                "✓ Added"
+                if saved
+                else "＋ Later",
                 key=f"later_{section}_{source}_{mid}",
                 width="stretch"
             ):
-                toggle_saved(st.session_state.watch_later, movie_data)
+
+                toggle_saved(
+                    st.session_state.watch_later,
+                    movie_data
+                )
+
                 st.rerun()
 
 
-def render_movies(movies, source="tmdb", columns=5, section="default"):
-    if isinstance(movies, pd.DataFrame):
-        movies = movies.to_dict("records")
+def render_movies(
+    movies,
+    source="tmdb",
+    columns=5,
+    section="default"
+):
+
+    if isinstance(
+        movies,
+        pd.DataFrame
+    ):
+        movies = movies.to_dict(
+            "records"
+        )
 
     if not movies:
-        st.info("No movies found.")
+
+        st.info(
+            "No movies found."
+        )
+
         return
 
-    # Never create one column per movie: that makes each card collapse as the
-    # list grows. Render a bounded grid instead so cards keep readable widths.
     try:
-        columns = max(1, min(int(columns), 6))
-    except (TypeError, ValueError):
+
+        columns = max(
+            1,
+            min(
+                int(columns),
+                6
+            )
+        )
+
+    except (
+        TypeError,
+        ValueError
+    ):
+
         columns = 5
 
-    for start in range(0, len(movies), columns):
-        batch = movies[start:start + columns]
-        cols = st.columns(len(batch), gap="small")
-        for col, movie in zip(cols, batch):
+    for start in range(
+        0,
+        len(movies),
+        columns
+    ):
+
+        batch = movies[
+            start:start + columns
+        ]
+
+        cols = st.columns(
+            len(batch),
+            gap="small"
+        )
+
+        for col, movie in zip(
+            cols,
+            batch
+        ):
+
             with col:
-                movie_card(movie, source, section)
+
+                movie_card(
+                    movie,
+                    source,
+                    section
+                )
 
 
-@st.cache_data(ttl=900, show_spinner=False, max_entries=256)
-def discover_page(category, page):
-    """Cached single-page TMDB discovery; page numbers are 1-based."""
-    result = discover_movies(category, page=page)
+@st.cache_data(
+    ttl=900,
+    show_spinner=False,
+    max_entries=256
+)
+def discover_page(
+    category,
+    page
+):
+
+    result = discover_movies(
+        category,
+        page=page
+    )
+
     return result
 
 
-def render_category_feed(category, heading=None, initial_count=10):
-    """Render a horizontally scrollable, incrementally paginated feed."""
-    key = "feed_" + category.lower().replace(" & ", "_").replace(" ", "_").replace(" ", "_")
+def render_category_feed(
+    category,
+    heading=None,
+    initial_count=10
+):
+
+    key = (
+        "feed_"
+        +
+        category
+        .lower()
+        .replace(" & ", "_")
+        .replace(" ", "_")
+        .replace(" ", "_")
+    )
+
     if key not in st.session_state:
-        st.session_state[key] = {"page": 1, "movies": [], "seen": set(), "done": False}
+
+        st.session_state[key] = {
+            "page": 1,
+            "movies": [],
+            "seen": set(),
+            "done": False
+        }
 
     state = st.session_state[key]
+
     if not state["movies"]:
-        first = discover_page(category, 1)
-        state["movies"] = list(first)
+
+        first = discover_page(
+            category,
+            1
+        )
+
+        state["movies"] = list(
+            first
+        )
+
         state["page"] = 1
-        state["done"] = len(first) == 0
-        state["seen"] = {m.get("id") for m in first if m.get("id") is not None}
 
-    st.markdown(f'<div class="section-heading">{html.escape(heading or category)}</div>', unsafe_allow_html=True)
+        state["done"] = (
+            len(first) == 0
+        )
+
+        state["seen"] = {
+            m.get("id")
+            for m in first
+            if m.get("id") is not None
+        }
+
+    st.markdown(
+        f'<div class="section-heading">{html.escape(heading or category)}</div>',
+        unsafe_allow_html=True
+    )
+
     shown = state["movies"]
-    render_movies(shown, columns=5, section=key)
 
-    next_col, info_col = st.columns([1, 4])
+    render_movies(
+        shown,
+        columns=5,
+        section=key
+    )
+
+    next_col, info_col = st.columns(
+        [1, 4]
+    )
+
     with next_col:
-        if not state["done"] and st.button("＋ Load more", key=f"load_{key}", width="stretch"):
-            next_page = state["page"] + 1
-            more = discover_page(category, next_page)
-            added = [m for m in more if m.get("id") not in state["seen"]]
-            state["movies"].extend(added)
-            state["seen"].update(m.get("id") for m in added if m.get("id") is not None)
+
+        if (
+            not state["done"]
+            and
+            st.button(
+                "＋ Load more",
+                key=f"load_{key}",
+                width="stretch"
+            )
+        ):
+
+            next_page = (
+                state["page"] + 1
+            )
+
+            more = discover_page(
+                category,
+                next_page
+            )
+
+            added = [
+                m for m in more
+                if m.get("id")
+                not in state["seen"]
+            ]
+
+            state["movies"].extend(
+                added
+            )
+
+            state["seen"].update(
+                m.get("id")
+                for m in added
+                if m.get("id") is not None
+            )
+
             state["page"] = next_page
-            state["done"] = not more or next_page >= 500
+
+            state["done"] = (
+                not more
+                or
+                next_page >= 500
+            )
+
             st.rerun()
+
     with info_col:
-        st.caption(f"Showing {len(shown)} movies · Scroll horizontally to explore")
+
+        st.caption(
+            f"Showing {len(shown)} movies · Scroll horizontally to explore"
+        )
 
 
 # ==========================================================
@@ -756,10 +1680,14 @@ def render_category_feed(category, heading=None, initial_count=10):
 # ==========================================================
 
 def render_home():
+
     st.markdown(
         """
         <div class="hero">
-            <div class="hero-title">Your next movie awaits.</div>
+            <div class="hero-title">
+                Your next movie awaits.
+            </div>
+
             <div class="hero-subtitle">
                 Discover films, explore what's trending,
                 and find something worth watching.
@@ -780,7 +1708,12 @@ def render_home():
     ]
 
     for heading, category in sections:
-        render_category_feed(category, heading=heading, initial_count=10)
+
+        render_category_feed(
+            category,
+            heading=heading,
+            initial_count=10
+        )
 
 
 # ==========================================================
@@ -788,8 +1721,12 @@ def render_home():
 # ==========================================================
 
 def render_search():
+
     st.title("Search movies")
-    st.caption("Search using a full or partial movie title.")
+
+    st.caption(
+        "Search using a full or partial movie title."
+    )
 
     query = st.text_input(
         "Movie title",
@@ -798,35 +1735,62 @@ def render_search():
     )
 
     if query.strip():
-        suggestions = search_movies(query)
+
+        suggestions = search_movies(
+            query
+        )
 
         if suggestions:
+
             options = {
                 f"{m.get('title', 'Untitled')} "
-                f"({(m.get('release_date') or '????')[:4]})": m
+                f"({(m.get('release_date') or '????')[:4]})":
+                    m
                 for m in suggestions[:10]
             }
 
             selected = st.selectbox(
                 "Matching movies",
-                ["Select a movie"] + list(options.keys()),
+                ["Select a movie"]
+                +
+                list(options.keys()),
                 key="search_suggestion"
             )
 
             if selected != "Select a movie":
-                if st.button("Open selected movie", type="primary"):
-                    st.session_state.selected_movie = options[selected]
-                    st.session_state.page = "Movie details"
+
+                if st.button(
+                    "Open selected movie",
+                    type="primary"
+                ):
+
+                    st.session_state.selected_movie = (
+                        options[selected]
+                    )
+
+                    st.session_state.page = (
+                        "Movie details"
+                    )
+
                     st.rerun()
+
         else:
-            st.info("No matching movies found.")
+
+            st.info(
+                "No matching movies found."
+            )
 
     st.divider()
-    st.subheader("Browse by filters")
+
+    st.subheader(
+        "Browse by filters"
+    )
 
     genre = st.selectbox(
         "Genre",
-        ["All genres"] + list(GENRES.keys()),
+        ["All genres"]
+        +
+        list(GENRES.keys()),
         key="filter_genre"
     )
 
@@ -834,61 +1798,140 @@ def render_search():
         "Release year",
         min_value=1900,
         max_value=TODAY.year + 5,
-        value=(2000, TODAY.year + 5),
+        value=(
+            2000,
+            TODAY.year + 5
+        ),
         key="filter_year"
     )
 
     minimum_rating = st.slider(
         "Minimum rating",
-        0.0, 10.0, 0.0, 0.5,
+        0.0,
+        10.0,
+        0.0,
+        0.5,
         key="filter_rating"
     )
 
     sort_by = st.selectbox(
         "Sort by",
-        ["Popularity", "Rating", "Release date"],
+        [
+            "Popularity",
+            "Rating",
+            "Release date"
+        ],
         key="filter_sort"
     )
 
     col1, col2 = st.columns(2)
 
     with col1:
-        if st.button("Apply filters", type="primary",
-                     width="stretch"):
+
+        if st.button(
+            "Apply filters",
+            type="primary",
+            width="stretch"
+        ):
+
             params = {
                 "include_adult": "false",
                 "sort_by": {
-                    "Popularity": "popularity.desc",
-                    "Rating": "vote_average.desc",
-                    "Release date": "primary_release_date.desc"
+                    "Popularity":
+                        "popularity.desc",
+                    "Rating":
+                        "vote_average.desc",
+                    "Release date":
+                        "primary_release_date.desc"
                 }[sort_by],
                 "vote_count.gte": 5,
-                "primary_release_date.gte": f"{year_range[0]}-01-01",
-                "primary_release_date.lte": f"{year_range[1]}-12-31",
-                "vote_average.gte": minimum_rating,
+                "primary_release_date.gte":
+                    f"{year_range[0]}-01-01",
+                "primary_release_date.lte":
+                    f"{year_range[1]}-12-31",
+                "vote_average.gte":
+                    minimum_rating,
                 "page": 1
             }
 
             if genre != "All genres":
-                params["with_genres"] = GENRES[genre]
 
-            data = tmdb_get("discover/movie", params)
-            st.session_state.filtered_movies = (
-                data.get("results", []) if isinstance(data, dict) else []
+                params["with_genres"] = (
+                    GENRES[genre]
+                )
+
+            # --------------------------------------------------
+            # Primary source: TMDB
+            # --------------------------------------------------
+
+            data = tmdb_get(
+                "discover/movie",
+                params
             )
 
+            tmdb_results = (
+                data.get("results", [])
+                if isinstance(
+                    data,
+                    dict
+                )
+                else []
+            )
+
+            if tmdb_results:
+
+                st.session_state.filtered_movies = (
+                    tmdb_results
+                )
+
+            else:
+
+                # ----------------------------------------------
+                # Fallback: local catalog
+                # ----------------------------------------------
+
+                st.session_state.filtered_movies = (
+                    local_filtered_movies(
+                        genre,
+                        year_range,
+                        minimum_rating,
+                        sort_by
+                    )
+                )
+
     with col2:
-        if st.button("Reset filters", width="stretch"):
+
+        if st.button(
+            "Reset filters",
+            width="stretch"
+        ):
+
             st.session_state.filtered_movies = []
-            for key in ("filter_genre", "filter_year",
-                        "filter_rating", "filter_sort"):
+
+            for key in (
+                "filter_genre",
+                "filter_year",
+                "filter_rating",
+                "filter_sort"
+            ):
+
                 if key in st.session_state:
+
                     del st.session_state[key]
+
             st.rerun()
 
     if st.session_state.filtered_movies:
-        st.subheader("Filtered movies")
-        render_movies(st.session_state.filtered_movies, columns=5, section="filtered_search")
+
+        st.subheader(
+            "Filtered movies"
+        )
+
+        render_movies(
+            st.session_state.filtered_movies,
+            columns=5,
+            section="filtered_search"
+        )
 
 
 # ==========================================================
@@ -896,86 +1939,204 @@ def render_search():
 # ==========================================================
 
 def render_details():
-    movie = st.session_state.selected_movie
+
+    movie = (
+        st.session_state.selected_movie
+    )
 
     if not movie:
-        st.info("Select a movie first.")
+
+        st.info(
+            "Select a movie first."
+        )
+
         return
 
-    if st.button("← Back to Home"):
-        st.session_state.page = "Home"
+    if st.button(
+        "← Back to Home"
+    ):
+
+        st.session_state.page = (
+            "Home"
+        )
+
         st.rerun()
 
-    details = tmdb_details(movie.get("id"))
+    # ------------------------------------------------------
+    # Try TMDB details first
+    # ------------------------------------------------------
+
+    details = tmdb_details(
+        movie.get("id")
+    )
+
     if details:
-        movie = {**movie, **details}
 
-    backdrop = movie.get("backdrop_path")
+        movie = {
+            **movie,
+            **details
+        }
+
+    # ------------------------------------------------------
+    # Backdrop
+    # ------------------------------------------------------
+
+    backdrop = movie.get(
+        "backdrop_path"
+    )
+
     if backdrop:
-        st.image(image_url(backdrop, "w1280"), width="stretch")
 
-    st.title(movie.get("title", "Untitled"))
+        st.image(
+            image_url(
+                backdrop,
+                "w1280"
+            ),
+            width="stretch"
+        )
 
-    rating = movie.get("vote_average", 0)
-    release = movie.get("release_date", "Unknown")
-    runtime = movie.get("runtime")
+    st.title(
+        movie.get(
+            "title",
+            "Untitled"
+        )
+    )
 
-    line = f"⭐ {float(rating or 0):.1f} · {release}"
+    rating = movie.get(
+        "vote_average",
+        0
+    )
+
+    release = movie.get(
+        "release_date",
+        "Unknown"
+    )
+
+    runtime = movie.get(
+        "runtime"
+    )
+
+    line = (
+        f"⭐ {float(rating or 0):.1f} · "
+        f"{release}"
+    )
+
     if runtime:
-        line += f" · {runtime} min"
+
+        line += (
+            f" · {runtime} min"
+        )
+
     st.caption(line)
 
-    genres = movie.get("genres", [])
-    if isinstance(genres, list):
+    genres = movie.get(
+        "genres",
+        []
+    )
+
+    if isinstance(
+        genres,
+        list
+    ):
+
         names = [
-            g.get("name", "") if isinstance(g, dict) else str(g)
+            g.get("name", "")
+            if isinstance(g, dict)
+            else str(g)
             for g in genres
         ]
-        if names:
-            st.write(" · ".join(names))
 
-    if movie.get("overview"):
-        st.write(movie["overview"])
+        if names:
+
+            st.write(
+                " · ".join(names)
+            )
+
+    if movie.get(
+        "overview"
+    ):
+
+        st.write(
+            movie["overview"]
+        )
 
     c1, c2 = st.columns(2)
 
     with c1:
+
         if st.button(
-            "★ Remove bookmark" if is_saved(
-                st.session_state.bookmarks, movie
-            ) else "☆ Add bookmark",
+            "★ Remove bookmark"
+            if is_saved(
+                st.session_state.bookmarks,
+                movie
+            )
+            else "☆ Add bookmark",
             width="stretch"
         ):
-            toggle_saved(st.session_state.bookmarks, movie)
+
+            toggle_saved(
+                st.session_state.bookmarks,
+                movie
+            )
+
             st.rerun()
 
     with c2:
+
         if st.button(
-            "✓ Remove from Watch Later" if is_saved(
-                st.session_state.watch_later, movie
-            ) else "＋ Add to Watch Later",
+            "✓ Remove from Watch Later"
+            if is_saved(
+                st.session_state.watch_later,
+                movie
+            )
+            else "＋ Add to Watch Later",
             width="stretch"
         ):
-            toggle_saved(st.session_state.watch_later, movie)
+
+            toggle_saved(
+                st.session_state.watch_later,
+                movie
+            )
+
             st.rerun()
 
     st.divider()
-    st.subheader("Similar movies")
+
+    st.subheader(
+        "Similar movies"
+    )
 
     recommendations = pd.DataFrame()
 
     if MODEL_READY:
-        recommendations = hybrid_recommend(movie.get("id"), 20)
+
+        recommendations = hybrid_recommend(
+            movie.get("id"),
+            20
+        )
 
     if not recommendations.empty:
-        render_movies(recommendations, source="model", columns=5, section="similar_model")
+
+        render_movies(
+            recommendations,
+            source="model",
+            columns=5,
+            section="similar_model"
+        )
+
     else:
+
         st.caption(
             "This movie is not available in the trained model. "
             "Showing TMDB recommendations instead."
         )
+
+        similar_movies = tmdb_similar(
+            movie.get("id")
+        )
+
         render_movies(
-            tmdb_similar(movie.get("id"))[:20],
+            similar_movies[:20],
             columns=5,
             section="similar_tmdb"
         )
@@ -985,146 +2146,500 @@ def render_details():
 # 12. BOOKMARKS AND WATCH LATER
 # ==========================================================
 
-def render_collection(title, collection):
+def render_collection(
+    title,
+    collection
+):
+
     st.title(title)
+
     st.caption(
         "Saved for this browser session. "
         "These lists are not synchronized across devices."
     )
 
-    movies = list(collection.values())
+    movies = list(
+        collection.values()
+    )
 
     if not movies:
-        st.info(f"Your {title.lower()} list is empty.")
+
+        st.info(
+            f"Your {title.lower()} list is empty."
+        )
+
         return
 
-    if st.button(f"Clear {title}"):
+    if st.button(
+        f"Clear {title}"
+    ):
+
         collection.clear()
         st.rerun()
 
-    render_movies(movies, columns=5, section=title.lower().replace(" ", "_"))
+    render_movies(
+        movies,
+        columns=5,
+        section=title.lower().replace(
+            " ",
+            "_"
+        )
+    )
 
 
 # ==========================================================
 # 12. MODEL EVALUATION DASHBOARD
 # ==========================================================
+
 def render_evaluation():
-    st.title("Model Evaluation")
-    st.caption("Diagnostics for the trained recommendation models.")
+
+    st.title(
+        "Model Evaluation"
+    )
+
+    st.caption(
+        "Diagnostics for the trained recommendation models."
+    )
 
     if not MODEL_READY or MOVIES.empty:
-        st.error("The trained model or movie catalog is unavailable.")
+
+        st.error(
+            "The trained model or movie catalog is unavailable."
+        )
+
         return
 
     content_ids = set()
     collaborative_ids = set()
+
     try:
-        content_ids = {int(x) for x in MODEL["movie_indices"].keys()}
-    except Exception:
-        pass
-    try:
-        collaborative_ids = {int(x) for x in MODEL["movie_to_idx"].keys()}
+
+        content_ids = {
+            int(x)
+            for x in
+            MODEL["movie_indices"].keys()
+        }
+
     except Exception:
         pass
 
-    catalog_ids = set(MOVIES["id"].astype(int).tolist())
-    hybrid_ids = content_ids | collaborative_ids
-    covered_ids = catalog_ids & hybrid_ids
-    coverage = (len(covered_ids) / len(catalog_ids) * 100) if catalog_ids else 0
+    try:
+
+        collaborative_ids = {
+            int(x)
+            for x in
+            MODEL["movie_to_idx"].keys()
+        }
+
+    except Exception:
+        pass
+
+    catalog_ids = set(
+        MOVIES["id"]
+        .astype(int)
+        .tolist()
+    )
+
+    hybrid_ids = (
+        content_ids
+        |
+        collaborative_ids
+    )
+
+    covered_ids = (
+        catalog_ids
+        &
+        hybrid_ids
+    )
+
+    coverage = (
+        len(covered_ids)
+        /
+        len(catalog_ids)
+        *
+        100
+        if catalog_ids
+        else 0
+    )
 
     c1, c2, c3, c4 = st.columns(4)
-    c1.metric("Movies in catalog", f"{len(catalog_ids):,}")
-    c2.metric("Content model movies", f"{len(content_ids):,}")
-    c3.metric("Collaborative model movies", f"{len(collaborative_ids):,}")
-    c4.metric("Catalog coverage", f"{coverage:.1f}%")
+
+    c1.metric(
+        "Movies in catalog",
+        f"{len(catalog_ids):,}"
+    )
+
+    c2.metric(
+        "Content model movies",
+        f"{len(content_ids):,}"
+    )
+
+    c3.metric(
+        "Collaborative model movies",
+        f"{len(collaborative_ids):,}"
+    )
+
+    c4.metric(
+        "Catalog coverage",
+        f"{coverage:.1f}%"
+    )
 
     st.divider()
-    st.subheader("Model availability")
-    status = pd.DataFrame([
-        {"Component": "TF-IDF content model", "Status": "Ready" if MODEL.get("tfidf") is not None else "Missing"},
-        {"Component": "Collaborative factors", "Status": "Ready" if MODEL.get("movie_factors") is not None else "Missing"},
-        {"Component": "Hybrid ranker", "Status": "Ready" if content_ids and collaborative_ids else "Partially available"},
-        {"Component": "Movie metadata", "Status": "Ready" if not MOVIES.empty else "Missing"}
-    ])
-    st.dataframe(status, hide_index=True, width="stretch")
 
-    st.subheader("Recommendation comparison")
-    st.write("Choose a movie that exists in the trained catalog to compare the three ranking methods.")
-    options = MOVIES[["id", "title"]].drop_duplicates("id").sort_values("title")
-    title_to_id = {f"{row.title} (ID: {int(row.id)})": int(row.id) for row in options.itertuples()}
-    selected_label = st.selectbox("Movie", list(title_to_id.keys()), key="eval_seed_movie")
-    top_k = st.slider("Recommendations to compare", 5, 30, 10, key="eval_top_k")
+    st.subheader(
+        "Model availability"
+    )
+
+    status = pd.DataFrame([
+        {
+            "Component":
+                "TF-IDF content model",
+            "Status":
+                "Ready"
+                if MODEL.get("tfidf")
+                is not None
+                else "Missing"
+        },
+        {
+            "Component":
+                "Collaborative factors",
+            "Status":
+                "Ready"
+                if MODEL.get("movie_factors")
+                is not None
+                else "Missing"
+        },
+        {
+            "Component":
+                "Hybrid ranker",
+            "Status":
+                "Ready"
+                if content_ids
+                and collaborative_ids
+                else "Partially available"
+        },
+        {
+            "Component":
+                "Movie metadata",
+            "Status":
+                "Ready"
+                if not MOVIES.empty
+                else "Missing"
+        }
+    ])
+
+    st.dataframe(
+        status,
+        hide_index=True,
+        width="stretch"
+    )
+
+    st.subheader(
+        "Recommendation comparison"
+    )
+
+    st.write(
+        "Choose a movie that exists in the trained catalog "
+        "to compare the three ranking methods."
+    )
+
+    options = (
+        MOVIES[
+            ["id", "title"]
+        ]
+        .drop_duplicates("id")
+        .sort_values("title")
+    )
+
+    title_to_id = {
+        f"{row.title} (ID: {int(row.id)})":
+            int(row.id)
+        for row in options.itertuples()
+    }
+
+    selected_label = st.selectbox(
+        "Movie",
+        list(title_to_id.keys()),
+        key="eval_seed_movie"
+    )
+
+    top_k = st.slider(
+        "Recommendations to compare",
+        5,
+        30,
+        10,
+        key="eval_top_k"
+    )
 
     if selected_label:
-        movie_id = title_to_id[selected_label]
-        content_scores = get_content_scores(movie_id)
-        cf_scores = get_collaborative_scores(movie_id)
 
-        def ranked_frame(scores, score_name):
-            rows = [(int(mid), float(score)) for mid, score in scores.items() if int(mid) != movie_id and np.isfinite(score)]
-            frame = pd.DataFrame(rows, columns=["id", score_name])
-            if frame.empty:
-                return frame
-            return frame.sort_values(score_name, ascending=False).head(top_k).merge(
-                MOVIES[["id", "title", "vote_average"]], on="id", how="inner"
+        movie_id = title_to_id[
+            selected_label
+        ]
+
+        content_scores = (
+            get_content_scores(
+                movie_id
+            )
+        )
+
+        cf_scores = (
+            get_collaborative_scores(
+                movie_id
+            )
+        )
+
+        def ranked_frame(
+            scores,
+            score_name
+        ):
+
+            rows = [
+                (
+                    int(mid),
+                    float(score)
+                )
+                for mid, score
+                in scores.items()
+                if int(mid) != movie_id
+                and np.isfinite(score)
+            ]
+
+            frame = pd.DataFrame(
+                rows,
+                columns=[
+                    "id",
+                    score_name
+                ]
             )
 
-        content_frame = ranked_frame(content_scores, "content_score")
-        cf_frame = ranked_frame(cf_scores, "collaborative_cosine")
-        hybrid_frame = hybrid_recommend(movie_id, top_k)
-
-        def normalize_cf(frame):
             if frame.empty:
                 return frame
+
+            return (
+                frame
+                .sort_values(
+                    score_name,
+                    ascending=False
+                )
+                .head(top_k)
+                .merge(
+                    MOVIES[
+                        [
+                            "id",
+                            "title",
+                            "vote_average"
+                        ]
+                    ],
+                    on="id",
+                    how="inner"
+                )
+            )
+
+        content_frame = ranked_frame(
+            content_scores,
+            "content_score"
+        )
+
+        cf_frame = ranked_frame(
+            cf_scores,
+            "collaborative_cosine"
+        )
+
+        hybrid_frame = hybrid_recommend(
+            movie_id,
+            top_k
+        )
+
+        def normalize_cf(frame):
+
+            if frame.empty:
+                return frame
+
             frame = frame.copy()
-            frame["collaborative_score"] = ((frame["collaborative_cosine"] + 1) / 2).clip(0, 1)
+
+            frame[
+                "collaborative_score"
+            ] = (
+                (
+                    frame[
+                        "collaborative_cosine"
+                    ]
+                    + 1
+                )
+                / 2
+            ).clip(0, 1)
+
             return frame
 
-        cf_frame = normalize_cf(cf_frame)
+        cf_frame = normalize_cf(
+            cf_frame
+        )
+
         left, middle, right = st.columns(3)
+
         with left:
-            st.markdown("**Content-based**")
+
+            st.markdown(
+                "**Content-based**"
+            )
+
             if content_frame.empty:
-                st.info("No content recommendations available.")
+
+                st.info(
+                    "No content recommendations available."
+                )
+
             else:
-                st.dataframe(content_frame[["title", "content_score", "vote_average"]], hide_index=True, width="stretch")
+
+                st.dataframe(
+                    content_frame[
+                        [
+                            "title",
+                            "content_score",
+                            "vote_average"
+                        ]
+                    ],
+                    hide_index=True,
+                    width="stretch"
+                )
+
         with middle:
-            st.markdown("**Collaborative**")
+
+            st.markdown(
+                "**Collaborative**"
+            )
+
             if cf_frame.empty:
-                st.info("No collaborative recommendations available.")
+
+                st.info(
+                    "No collaborative recommendations available."
+                )
+
             else:
-                st.dataframe(cf_frame[["title", "collaborative_score", "vote_average"]], hide_index=True, width="stretch")
+
+                st.dataframe(
+                    cf_frame[
+                        [
+                            "title",
+                            "collaborative_score",
+                            "vote_average"
+                        ]
+                    ],
+                    hide_index=True,
+                    width="stretch"
+                )
+
         with right:
-            st.markdown("**Hybrid (60% / 40%)**")
+
+            st.markdown(
+                "**Hybrid (60% / 40%)**"
+            )
+
             if hybrid_frame.empty:
-                st.info("No hybrid recommendations available.")
+
+                st.info(
+                    "No hybrid recommendations available."
+                )
+
             else:
-                st.dataframe(hybrid_frame[["title", "hybrid_score", "vote_average"]], hide_index=True, width="stretch")
+
+                st.dataframe(
+                    hybrid_frame[
+                        [
+                            "title",
+                            "hybrid_score",
+                            "vote_average"
+                        ]
+                    ],
+                    hide_index=True,
+                    width="stretch"
+                )
 
         sets = []
-        for frame in (content_frame, cf_frame, hybrid_frame):
-            sets.append(set(frame["id"].astype(int)) if not frame.empty else set())
-        union = set.union(*sets) if sets else set()
-        overlap = len(sets[0] & sets[1]) if len(sets) >= 2 else 0
-        m1, m2, m3 = st.columns(3)
-        m1.metric("Content / collaborative overlap", f"{overlap} movies")
-        m2.metric("Unique movies across lists", f"{len(union)}")
-        m3.metric("Hybrid list size", f"{len(sets[2]) if len(sets) > 2 else 0}")
 
-        st.subheader("Hybrid score distribution")
-        if not hybrid_frame.empty and "hybrid_score" in hybrid_frame:
-            st.bar_chart(hybrid_frame.set_index("title")[["hybrid_score"]], height=300)
+        for frame in (
+            content_frame,
+            cf_frame,
+            hybrid_frame
+        ):
+
+            sets.append(
+                set(
+                    frame["id"]
+                    .astype(int)
+                )
+                if not frame.empty
+                else set()
+            )
+
+        union = (
+            set.union(*sets)
+            if sets
+            else set()
+        )
+
+        overlap = (
+            len(sets[0] & sets[1])
+            if len(sets) >= 2
+            else 0
+        )
+
+        m1, m2, m3 = st.columns(3)
+
+        m1.metric(
+            "Content / collaborative overlap",
+            f"{overlap} movies"
+        )
+
+        m2.metric(
+            "Unique movies across lists",
+            f"{len(union)}"
+        )
+
+        m3.metric(
+            "Hybrid list size",
+            f"{len(sets[2]) if len(sets) > 2 else 0}"
+        )
+
+        st.subheader(
+            "Hybrid score distribution"
+        )
+
+        if (
+            not hybrid_frame.empty
+            and
+            "hybrid_score"
+            in hybrid_frame
+        ):
+
+            st.bar_chart(
+                hybrid_frame
+                .set_index("title")
+                [["hybrid_score"]],
+                height=300
+            )
+
         else:
-            st.info("No hybrid scores are available for this movie.")
+
+            st.info(
+                "No hybrid scores are available for this movie."
+            )
 
     st.divider()
-    st.subheader("How to interpret these results")
-    st.markdown("""
+
+    st.subheader(
+        "How to interpret these results"
+    )
+
+    st.markdown(
+        """
 - **Catalog coverage** is the percentage of catalog movies represented in at least one trained model.
 - **Overlap** counts movies appearing in both content-based and collaborative top-K lists.
 - **Scores** are ranking signals, not probabilities or measures of recommendation accuracy.
 - This dashboard is a model diagnostic. Precision@K, Recall@K and NDCG@K require a held-out set of user–movie interactions and are intentionally not fabricated here.
-""")
+"""
+    )
 
 
 # ==========================================================
@@ -1132,8 +2647,14 @@ def render_evaluation():
 # ==========================================================
 
 with st.sidebar:
-    st.markdown("## 🎬 CineMatch")
-    st.caption("A universe of stories")
+
+    st.markdown(
+        "## 🎬 CineMatch"
+    )
+
+    st.caption(
+        "A universe of stories"
+    )
 
     st.selectbox(
         "Theme",
@@ -1159,7 +2680,13 @@ with st.sidebar:
     ]
 
     for page in pages:
-        label = "⌂  Home" if page == "Home" else page
+
+        label = (
+            "⌂  Home"
+            if page == "Home"
+            else page
+        )
+
         if st.button(
             label,
             key=f"nav_{page}",
@@ -1170,11 +2697,15 @@ with st.sidebar:
                 else "secondary"
             )
         ):
+
             st.session_state.page = page
             st.rerun()
 
     st.divider()
-    st.caption("Movie data provided by TMDB.")
+
+    st.caption(
+        "Movie data provided by TMDB."
+    )
 
 
 # ==========================================================
@@ -1182,18 +2713,26 @@ with st.sidebar:
 # ==========================================================
 
 if not TMDB_KEY:
+
     st.warning(
         "TMDB API key not found. Add TMDB_API_KEY to "
         ".streamlit/secrets.toml to enable live movie data."
     )
 
 if not MODEL_READY:
+
     st.warning(
         "The trained recommendation model could not be loaded. "
         "TMDB browsing can still work."
     )
-    with st.expander("Model loading details"):
-        st.code(MODEL_ERROR)
+
+    with st.expander(
+        "Model loading details"
+    ):
+
+        st.code(
+            MODEL_ERROR
+        )
 
 
 # ==========================================================
@@ -1202,27 +2741,56 @@ if not MODEL_READY:
 
 page = st.session_state.page
 
+
 if page == "Home":
+
     render_home()
 
+
 elif page == "Search":
+
     render_search()
 
+
 elif page in [
-    "Trending", "Popular", "Latest", "Upcoming",
-    "Highest Rated", "Kids & Family", "Now Playing"
+    "Trending",
+    "Popular",
+    "Latest",
+    "Upcoming",
+    "Highest Rated",
+    "Kids & Family",
+    "Now Playing"
 ]:
+
     st.title(page)
-    render_category_feed(page, heading=page)
+
+    render_category_feed(
+        page,
+        heading=page
+    )
+
 
 elif page == "Bookmarks":
-    render_collection("Bookmarks", st.session_state.bookmarks)
+
+    render_collection(
+        "Bookmarks",
+        st.session_state.bookmarks
+    )
+
 
 elif page == "Watch Later":
-    render_collection("Watch Later", st.session_state.watch_later)
+
+    render_collection(
+        "Watch Later",
+        st.session_state.watch_later
+    )
+
 
 elif page == "Movie details":
+
     render_details()
 
+
 elif page == "Model Evaluation":
+
     render_evaluation()
